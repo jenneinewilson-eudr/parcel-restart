@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ΔNDVI & ΔNBR with Date Selector + WMS Layers</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css"/>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.css" />
+  <script src="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.js"></script>
+
+  <!-- dom-to-image (kept; export uses WMS GetMap) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js"></script>
+
+  <style>
+    #map { height: 100vh; }
+
+    #controlPanel {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      z-index: 1000;
+      background: white;
+      padding: 10px;
+      border: 1px solid #ccc;
+      border-radius: 5px;
+    }
+    #controlPanel input, #controlPanel button {
+      margin: 5px 0;
+      width: 150px;
+    }
+
+    .ndvi-label {
+      background: white;
+      padding: 2px 4px;
+      border: 1px solid black;
+      border-radius: 3px;
+      font-size: 12px;
+      pointer-events: none;
+    }
+
+    #legend {
+      position: absolute;
+      bottom: 30px;
+      left: 10px;
+      z-index: 1000;
+      background: white;
+      padding: 6px 10px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+
+    .leaflet-control-layers {
+      top: 120px !important;
+    }
+  </style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="controlPanel">
+  <label for="afterDateInput">After Date:</label>
+  <input type="date" id="afterDateInput" value="2024-06-01"/>
+  <button id="exportBtn">Export GeoJSON</button>
+  <button id="saveParcelBtn">Save Parcel Image</button>
+</div>
+
+<div id="legend">
+  <strong>ΔNDVI Legend</strong><br>
+  <div style="color:green">ΔNDVI ≥ -0.05 → No Deforestation ✅</div>
+  <div style="color:orange">-0.2 < ΔNDVI < -0.05 → Risk Suspected ⚠️</div>
+  <div style="color:red">ΔNDVI ≤ -0.2 → Deforestation Confirmed ❌</div>
+  <div style="color:gray">No data / Error → Unclear ❔</div>
+  <br>
+  <strong>ΔNBR Legend</strong><br>
+  <div style="color:green">ΔNBR ≥ -0.1 → Stable vegetation 🌱</div>
+  <div style="color:red">ΔNBR < -0.1 → Burn🔥</div>
+</div>
+
+<script>
+const CLIENT_ID = "71788e62-4d98-430b-92ca-ff50f1a90a7a";
+const CLIENT_SECRET = "wAgxFCqKoMXTu4XVwMRO7GyLwdvWDNtC";
+const USER_ID = null;
+const INSTANCE_ID = "ec33a269-ab29-49db-ae6b-77058dc9d53a";
+
+/**
+ * Sharper export:
+ * - Increase GetMap size (still limited by Sentinel-2 native resolution, but reduces blockiness)
+ * - Keep a small margin around parcel so the label doesn't cover the polygon
+ */
+const EXPORT_WIDTH = 4096;          // sharper
+const EXPORT_BBOX_MARGIN = 0.08;    // 8% margin around parcel for label space (export only)
+
+const map = L.map('map').setView([0, 0], 2);
+
+const streetLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+  attribution: '&copy; OpenStreetMap contributors',
+  crossOrigin: "anonymous"
+}).addTo(map);
+
+let satelliteLayer = L.tileLayer.wms(`https://services.sentinel-hub.com/ogc/wms/${INSTANCE_ID}`, {
+  layers: "TEST-AGAIN",
+  format: "image/png",
+  transparent: true,
+  attribution: "Sentinel-2",
+  tileSize: 1024,
+  crossOrigin: "anonymous"
+}).addTo(map);
+
+let ndviLayer = L.tileLayer.wms(`https://services.sentinel-hub.com/ogc/wms/${INSTANCE_ID}`, {
+  layers: "NEW-NDVI",
+  format: "image/png",
+  transparent: true,
+  attribution: "Sentinel-2 NDVI",
+  tileSize: 2048,
+  opacity: 0.5,
+  crossOrigin: "anonymous"
+}).addTo(map);
+
+const baseLayers = { "Street": streetLayer };
+const overlays = { "Satellite": satelliteLayer, "NDVI": ndviLayer };
+L.control.layers(baseLayers, overlays).addTo(map);
+
+const geocoder = L.Control.geocoder({ defaultMarkGeocode: false }).addTo(map);
+let selectedLocation = null;
+geocoder.on('markgeocode', function(e){
+  map.setView(e.geocode.center, 12);
+  selectedLocation = { name: e.geocode.name, bbox: e.geocode.bbox };
+});
+
+const drawnItems = new L.FeatureGroup();
+map.addLayer(drawnItems);
+const labelMarkers = new Map();
+
+// Keep last computed statuses so image export can print them
+const polygonStatusById = new Map();
+
+const drawControl = new L.Control.Draw({
+  edit: { featureGroup: drawnItems },
+  draw: { polygon: true, polyline: false, rectangle: false, circle: false, marker: false, circlemarker: false }
+});
+map.addControl(drawControl);
+
+async function getToken(){
+  const res = await fetch("https://corsproxy.io/?" + encodeURIComponent("https://services.sentinel-hub.com/oauth/token"), {
+    method:"POST",
+    headers:{"Content-Type":"application/x-www-form-urlencoded"},
+    body:`client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}&grant_type=client_credentials`
+  });
+  const data = await res.json();
+  return data.access_token;
+}
+
+// --- simplified processCanvas to get actual NDVI/NBR values ---
+async function fetchIndexAverage(token, bbox, from, to, type="ndvi"){
+  let evalscript;
+  if(type==="ndvi"){
+    evalscript = `//VERSION=3
+      function setup(){return {input:["B04","B08"],output:{bands:1}};}
+      function evaluatePixel(s){let v=(s.B08-s.B04)/(s.B08+s.B04);return [Math.max(-1,Math.min(1,v))];}`;
+  } else if(type==="nbr"){
+    evalscript = `//VERSION=3
+      function setup(){return {input:["B08","B12"],output:{bands:1}};}
+      function evaluatePixel(s){let v=(s.B08-s.B12)/(s.B08+s.B12);return [Math.max(-1,Math.min(1,v))];}`;
+  }
+  const body = {
+    input: { bounds:{bbox}, data:[{type:"sentinel-2-l2a", dataFilter:{timeRange:{from,to}}}] },
+    output: { width:512, height:512, responses:[{identifier:"default", format:{type:"image/png"}}] },
+    evalscript
+  };
+  const res = await fetch("https://corsproxy.io/?" + encodeURIComponent("https://services.sentinel-hub.com/api/v1/process"), {
+    method:"POST",
+    headers:{ "Authorization":"Bearer "+token, "Content-Type":"application/json" },
+    body: JSON.stringify(body)
+  });
+  const blob = await res.blob();
+  return new Promise(resolve=>{
+    const img = new Image();
+    img.onload = ()=>{
+      const canvas = document.createElement("canvas");
+      canvas.width = img.width; canvas.height = img.height;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img,0,0);
+      const data=ctx.getImageData(0,0,img.width,img.height).data;
+      let sum=0,count=0;
+      for(let i=0;i<data.length;i+=4){
+        const val = data[i];
+        if(val!==0){ sum += (val/255*2-1); count++; }
+      }
+      resolve(count>0? sum/count : null);
+    };
+    img.src = URL.createObjectURL(blob);
+  });
+}
+
+function generateUUID(){
+  return 'xxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,function(c){
+    let r=Math.random()*16|0,v=c=='x'?r:(r&0x3|0x8);
+    return v.toString(16);
+  });
+}
+
+/**
+ * Hectares calculation (geodesic), written into GeoJSON properties.
+ */
+function ringAreaSqm(latlngs){
+  const R = 6378137;
+  let area = 0;
+  if (!latlngs || latlngs.length < 3) return 0;
+  for (let i = 0, j = latlngs.length - 1; i < latlngs.length; j = i++) {
+    const p1 = latlngs[j];
+    const p2 = latlngs[i];
+    const lon1 = p1.lng * Math.PI / 180;
+    const lon2 = p2.lng * Math.PI / 180;
+    const lat1 = p1.lat * Math.PI / 180;
+    const lat2 = p2.lat * Math.PI / 180;
+    area += (lon2 - lon1) * (2 + Math.sin(lat1) + Math.sin(lat2));
+  }
+  area = area * R * R / 2;
+  return Math.abs(area);
+}
+function getPolygonAreaSqm(layer){
+  const latlngs = layer.getLatLngs();
+  if (!latlngs || latlngs.length === 0) return 0;
+
+  // Polygon: [ [LatLng...] ]
+  if (Array.isArray(latlngs[0]) && latlngs[0][0] && typeof latlngs[0][0].lat === "number") {
+    return ringAreaSqm(latlngs[0]);
+  }
+
+  // MultiPolygon: [ [ [LatLng...] ], [ [LatLng...] ] ]
+  if (Array.isArray(latlngs[0]) && Array.isArray(latlngs[0][0])) {
+    let total = 0;
+    latlngs.forEach(polyRings => {
+      if (polyRings && polyRings[0] && polyRings[0][0] && typeof polyRings[0][0].lat === "number") {
+        total += ringAreaSqm(polyRings[0]);
+      }
+    });
+    return total;
+  }
+  return 0;
+}
+
+const polygonsData=[];
+const afterDateInput = document.getElementById("afterDateInput");
+
+afterDateInput.addEventListener("change", ()=>{
+  drawnItems.eachLayer(async polygon=>{
+    await calculateDelta(polygon);
+  });
+});
+
+async function calculateDelta(polygon){
+  const token = await getToken();
+  const bounds = polygon.getBounds();
+  const bbox = [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()];
+  const center = bounds.getCenter();
+  const dateBefore = "2023-06-01T00:00:00Z";
+
+  const afterDateStr = afterDateInput.value;
+  const dateAfterStart = `${afterDateStr}T00:00:00Z`;
+  const dateAfterEnd   = `${afterDateStr.slice(0,7)}-30T23:59:59Z`;
+
+  const ndviBefore = await fetchIndexAverage(token,bbox,dateBefore,"2023-06-30T23:59:59Z","ndvi");
+  const ndviAfter  = await fetchIndexAverage(token,bbox,dateAfterStart,dateAfterEnd,"ndvi");
+  const nbrBefore  = await fetchIndexAverage(token,bbox,dateBefore,"2023-06-30T23:59:59Z","nbr");
+  const nbrAfter   = await fetchIndexAverage(token,bbox,dateAfterStart,dateAfterEnd,"nbr");
+
+  let deltaNDVI = (ndviBefore!==null && ndviAfter!==null) ? ndviAfter-ndviBefore : null;
+  let deltaNBR  = (nbrBefore!==null && nbrAfter!==null) ? nbrAfter-nbrBefore : null;
+
+  let color="gray",status="Unclear ❔";
+  if(deltaNDVI!==null){
+    if(deltaNDVI >= -0.05){ color='green'; status=`No Deforestation ✅ (ΔNDVI ${deltaNDVI.toFixed(3)})`; }
+    else if(deltaNDVI < -0.05 && deltaNDVI > -0.2){ color='orange'; status=`Risk Suspected ⚠️ (ΔNDVI ${deltaNDVI.toFixed(3)})`; }
+    else { color='red'; status=`Deforestation Confirmed ❌ (ΔNDVI ${deltaNDVI.toFixed(3)})`; }
+  }
+
+  // Requested wording change:
+  let nbrStatus = "NBR unclear";
+  if(deltaNBR!==null){
+    nbrStatus = deltaNBR < -0.1 ? `Burn 🔥 (ΔNBR ${deltaNBR.toFixed(3)})`
+                                : `Stable vegetation 🌱 (ΔNBR ${deltaNBR.toFixed(3)})`;
+  }
+
+  const areaSqm = getPolygonAreaSqm(polygon);
+  const hectares = areaSqm / 10000;
+
+  const offsetLat = 0.002;
+  const offsetLng = 0.002;
+  const labelPos = [center.lat + offsetLat, center.lng + offsetLng];
+
+  const marker = L.marker(labelPos,{
+    icon:L.divIcon({className:'ndvi-label', html:`${status}<br>${nbrStatus}`, iconSize:[200,45]})
+  }).addTo(map);
+  labelMarkers.set(polygon._leaflet_id, marker);
+
+  polygonStatusById.set(polygon._leaflet_id, { status, nbrStatus, hectares });
+
+  const geojson=polygon.toGeoJSON();
+  geojson.properties={
+    tempId:generateUUID(),
+    parcelRowId:null,
+    userId:USER_ID,
+    areaSqm,
+    hectares,
+    ndviBefore,ndviAfter,deltaNDVI,
+    nbrBefore,nbrAfter,deltaNBR,
+    ndviStatus:status,
+    nbrStatus:nbrStatus,
+    dateBefore,dateAfter:afterDateStr,
+    location: selectedLocation ? selectedLocation.name : null
+  };
+  polygonsData.push(geojson);
+
+  satelliteLayer.setParams({time: afterDateStr});
+  ndviLayer.setParams({time: afterDateStr});
+}
+
+/**
+ * Parcel image fetch includes satellite:
+ * Uses Sentinel Hub WMS GetMap (layer: TEST-AGAIN) at high resolution.
+ */
+async function fetchWmsPngBlob(layerName, bbox, width, height, time){
+  // WMS 1.3.0 axis order for EPSG:4326: south,west,north,east
+  const south = bbox[1], west = bbox[0], north = bbox[3], east = bbox[2];
+
+  const base = `https://services.sentinel-hub.com/ogc/wms/${INSTANCE_ID}`;
+  const params =
+    `service=WMS&request=GetMap&version=1.3.0` +
+    `&layers=${encodeURIComponent(layerName)}` +
+    `&styles=` +
+    `&format=image/png` +
+    `&transparent=false` +
+    `&crs=EPSG:4326` +
+    `&bbox=${south},${west},${north},${east}` +
+    `&width=${width}&height=${height}` +
+    (time ? `&time=${encodeURIComponent(time)}` : '');
+
+  const url = `${base}?${params}`;
+
+  const res = await fetch("https://corsproxy.io/?" + encodeURIComponent(url));
+  if(!res.ok){
+    const txt = await res.text().catch(()=>"(no body)");
+    throw new Error(`WMS GetMap failed: ${res.status} ${res.statusText} :: ${txt.slice(0,300)}`);
+  }
+  return await res.blob();
+}
+
+function latLngToImageXY(latlng, bbox, width, height){
+  const west = bbox[0], south = bbox[1], east = bbox[2], north = bbox[3];
+  const x = (latlng.lng - west) / (east - west) * width;
+  const y = (north - latlng.lat) / (north - south) * height;
+  return { x, y };
+}
+
+function forceDownloadBlob(blob, filename){
+  if (window.navigator && window.navigator.msSaveOrOpenBlob) {
+    window.navigator.msSaveOrOpenBlob(blob, filename);
+    return;
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+/**
+ * Two-step download state:
+ * - First click generates PNG asynchronously and stores it.
+ * - Second click downloads synchronously (browser allows it).
+ */
+let preparedParcelBlob = null;
+let preparedParcelFilename = null;
+
+function expandBbox(bbox, marginFrac){
+  const west = bbox[0], south = bbox[1], east = bbox[2], north = bbox[3];
+  const lonSpan = Math.max(1e-9, east - west);
+  const latSpan = Math.max(1e-9, north - south);
+  const dx = lonSpan * marginFrac;
+  const dy = latSpan * marginFrac;
+  return [west - dx, south - dy, east + dx, north + dy];
+}
+
+async function prepareParcelImageBlob() {
+  // Most recently added polygon
+  let targetPolygon = null;
+  drawnItems.eachLayer(layer => { targetPolygon = layer; });
+
+  if(!targetPolygon){
+    throw new Error("No polygon");
+  }
+
+  const bounds = targetPolygon.getBounds();
+  const bbox = [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()];
+
+  // Export bbox with margin so the label can sit outside the parcel area
+  const exportBbox = expandBbox(bbox, EXPORT_BBOX_MARGIN);
+
+  const lonSpan = Math.max(1e-9, exportBbox[2] - exportBbox[0]);
+  const latSpan = Math.max(1e-9, exportBbox[3] - exportBbox[1]);
+  const width = EXPORT_WIDTH;
+  const height = Math.max(1, Math.round(width * (latSpan / lonSpan)));
+
+  const afterDateStr = afterDateInput.value;
+
+  // Satellite image via WMS (higher resolution)
+  const satBlob = await fetchWmsPngBlob("TEST-AGAIN", exportBbox, width, height, afterDateStr);
+
+  // Decode satellite
+  const imgUrl = URL.createObjectURL(satBlob);
+  const img = new Image();
+  await new Promise((resolve, reject) => {
+    img.onload = resolve;
+    img.onerror = reject;
+    img.src = imgUrl;
+  });
+  URL.revokeObjectURL(imgUrl);
+
+  // Compose final image
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+
+  // Make the down/up-sampling as clean as possible
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+
+  ctx.drawImage(img, 0, 0, width, height);
+
+  // Polygon overlay (keep polygon visible; reduce fill to avoid “tinted block” look)
+  ctx.lineWidth = 6;
+  ctx.strokeStyle = "yellow";
+  ctx.fillStyle = "rgba(255,255,0,0.06)";
+
+  const latlngs = targetPolygon.getLatLngs();
+  const ring =
+    (Array.isArray(latlngs[0]) && latlngs[0][0] && typeof latlngs[0][0].lat === "number")
+      ? latlngs[0]
+      : (Array.isArray(latlngs[0]) && Array.isArray(latlngs[0][0]) ? latlngs[0][0] : []);
+
+  if (ring.length > 1) {
+    ctx.beginPath();
+    ring.forEach((pt, idx) => {
+      const {x, y} = latLngToImageXY(pt, exportBbox, width, height);
+      if(idx === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  // Text block (move to bottom-left margin so it does not cover the polygon)
+  const st = polygonStatusById.get(targetPolygon._leaflet_id) || {};
+  const lines = [
+    st.status || "NDVI status pending...",
+    st.nbrStatus || "NBR status pending...",
+    (typeof st.hectares === "number") ? `${st.hectares.toFixed(2)} ha` : ""
+  ].filter(Boolean);
+
+  ctx.font = "26px Arial";
+  const pad = 14;
+  const lineH = 34;
+  const textW = Math.max(...lines.map(t => ctx.measureText(t).width), 0);
+  const boxW = Math.min(width - 40, textW + pad * 2);
+  const boxH = pad * 2 + lineH * lines.length;
+
+  const boxX = 20;
+  const boxY = Math.max(20, height - boxH - 20); // bottom-left
+
+  ctx.fillStyle = "rgba(255,255,255,0.92)";
+  ctx.strokeStyle = "black";
+  ctx.lineWidth = 2;
+  ctx.fillRect(boxX, boxY, boxW, boxH);
+  ctx.strokeRect(boxX, boxY, boxW, boxH);
+
+  ctx.fillStyle = "black";
+  lines.forEach((t, i) => {
+    ctx.fillText(t, boxX + pad, boxY + pad + (i + 1) * lineH - 8);
+  });
+
+  const filename = `parcel_satellite_${Date.now()}.png`;
+
+  const outBlob = await new Promise((resolve) => {
+    canvas.toBlob((b) => resolve(b), "image/png");
+  });
+
+  if(!outBlob){
+    throw new Error("Canvas toBlob failed");
+  }
+
+  preparedParcelBlob = outBlob;
+  preparedParcelFilename = filename;
+}
+
+// --- Save parcel image (two-step) ---
+async function saveFullMapImage() {
+  const btn = document.getElementById("saveParcelBtn");
+
+  // If we already prepared, download synchronously
+  if (preparedParcelBlob && preparedParcelFilename) {
+    forceDownloadBlob(preparedParcelBlob, preparedParcelFilename);
+    preparedParcelBlob = null;
+    preparedParcelFilename = null;
+    btn.textContent = "Save Parcel Image";
+    return;
+  }
+
+  // Otherwise: prepare
+  btn.textContent = "Preparing...";
+  btn.disabled = true;
+
+  try {
+    await prepareParcelImageBlob();
+    btn.textContent = "Download Parcel Image";
+    btn.disabled = false;
+  } catch (error) {
+    console.error("Error preparing image:", error);
+    btn.textContent = "Save Parcel Image";
+    btn.disabled = false;
+    alert("Export failed. Open the browser console for details.");
+  }
+}
+
+// --- Event listeners ---
+map.on(L.Draw.Event.CREATED, async e=>{
+  const layer = e.layer;
+  drawnItems.addLayer(layer);
+  await calculateDelta(layer);
+
+  // reset prepared download (polygon changed)
+  preparedParcelBlob = null;
+  preparedParcelFilename = null;
+  const btn = document.getElementById("saveParcelBtn");
+  btn.textContent = "Save Parcel Image";
+  btn.disabled = false;
+});
+
+map.on('draw:deleted', function(e){
+  e.layers.eachLayer(function(layer){
+    const marker = labelMarkers.get(layer._leaflet_id);
+    if(marker) map.removeLayer(marker);
+    labelMarkers.delete(layer._leaflet_id);
+    polygonStatusById.delete(layer._leaflet_id);
+
+    preparedParcelBlob = null;
+    preparedParcelFilename = null;
+    const btn = document.getElementById("saveParcelBtn");
+    btn.textContent = "Save Parcel Image";
+    btn.disabled = false;
+  });
+});
+
+document.getElementById("exportBtn").addEventListener("click", ()=>{
+  const geojsonStr=JSON.stringify({type:"FeatureCollection",features:polygonsData},null,2);
+  const blob=new Blob([geojsonStr],{type:"application/json"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url; a.download="polygons_ndvi_nbr.geojson";
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+document.getElementById("saveParcelBtn").addEventListener("click", saveFullMapImage);
+</script>
+
+</body>
+</html>
